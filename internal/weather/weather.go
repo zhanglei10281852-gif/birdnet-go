@@ -243,22 +243,84 @@ func (s *Service) activeProviderName() string {
 	return s.providerName
 }
 
+// canonicalProviderName maps a configured provider string to its canonical
+// name without constructing a provider implementation. disabled is true for
+// conf.WeatherNone and any unrecognized value; an empty string defaults to
+// yr.no. It is the pure identity half of resolveWeatherProvider, used by the
+// fetch configuration snapshot so the commit gate can compare provider
+// identities per cycle without allocating HTTP clients.
+func canonicalProviderName(providerStr string) (providerName string, disabled bool) {
+	switch conf.WeatherProvider(providerStr) {
+	case conf.WeatherYrNo, "":
+		return yrNoProviderName, false
+	case conf.WeatherOpenWeather:
+		return openWeatherProviderName, false
+	case conf.WeatherWunderground:
+		return wundergroundProviderName, false
+	case conf.WeatherPirateWeather:
+		return pirateWeatherProviderName, false
+	default:
+		return "", true
+	}
+}
+
 // resolveWeatherProvider maps a configured provider string to its Provider
 // implementation and canonical name, sharing a single HTTP client across
 // providers. disabled is true for conf.WeatherNone and any unrecognized value,
 // matching NewService's original switch; an empty string defaults to yr.no.
 func resolveWeatherProvider(providerStr string, weatherClient *http.Client) (provider Provider, providerName string, disabled bool) {
-	switch conf.WeatherProvider(providerStr) {
-	case conf.WeatherYrNo, "":
-		return NewYrNoProvider(weatherClient), yrNoProviderName, false
-	case conf.WeatherOpenWeather:
-		return NewOpenWeatherProvider(weatherClient), openWeatherProviderName, false
-	case conf.WeatherWunderground:
-		return NewWundergroundProvider(weatherClient), wundergroundProviderName, false
-	case conf.WeatherPirateWeather:
-		return NewPirateWeatherProvider(weatherClient), pirateWeatherProviderName, false
+	name, disabled := canonicalProviderName(providerStr)
+	if disabled {
+		return nil, "", true
+	}
+	switch name {
+	case yrNoProviderName:
+		return NewYrNoProvider(weatherClient), name, false
+	case openWeatherProviderName:
+		return NewOpenWeatherProvider(weatherClient), name, false
+	case wundergroundProviderName:
+		return NewWundergroundProvider(weatherClient), name, false
+	case pirateWeatherProviderName:
+		return NewPirateWeatherProvider(weatherClient), name, false
 	default:
 		return nil, "", true
+	}
+}
+
+// fetchConfigSnapshot is the provider/location identity captured when a fetch
+// cycle starts (after reconcileConfig). Settings are copy-on-write and can be
+// republished while a provider HTTP request is in flight (the site admin
+// saving a new provider or location through the settings UI does not take
+// fetchMu). A response is therefore only allowed to commit when the live
+// settings still resolve to the same snapshot once the response returns;
+// otherwise it is a late result of the previous configuration and must be
+// discarded before it can reach persistence, the current-weather gauges, or
+// the fetch telemetry. All fields are comparable, so snapshots compare with ==.
+type fetchConfigSnapshot struct {
+	// providerName is the canonical name of the provider implementation that
+	// served the fetch (post-reconcile), not the raw settings string.
+	providerName string
+	// latitude/longitude identify the configured observation location. They
+	// are deliberately not logged (PII).
+	latitude  float64
+	longitude float64
+}
+
+// captureFetchConfig builds the provider/location identity under which a fetch
+// for settings would run. An unrecognized or "none" provider keeps the
+// currently active implementation (reconcileConfig never tears a working
+// service down via hot-reload), so such an edit resolves to the active
+// provider name instead of a phantom identity and does not by itself mark an
+// in-flight result stale.
+func (s *Service) captureFetchConfig(settings *conf.Settings) fetchConfigSnapshot {
+	name, disabled := canonicalProviderName(settings.Realtime.Weather.Provider)
+	if disabled {
+		name = s.activeProviderName()
+	}
+	return fetchConfigSnapshot{
+		providerName: name,
+		latitude:     settings.BirdNET.Latitude,
+		longitude:    settings.BirdNET.Longitude,
 	}
 }
 
@@ -391,6 +453,14 @@ func NewService(settings *conf.Settings, db datastore.Interface, weatherMetrics 
 // It reads s.sunCalc, which reconcileConfig rebuilds under s.fetchMu when the
 // configured location changes, so it must be called with s.fetchMu held. It is
 // unexported for that reason; the only caller, fetchAndSave, holds the lock.
+//
+// Provenance contract: fetchAndSave MUST have passed its post-fetch commit
+// gate (the live provider/location snapshot still matches the one the fetch
+// started with) before calling this. Every visible side effect of a fetch —
+// daily_events and hourly_weather rows, the current-weather gauges, and the
+// DB success telemetry — originates here, so a late result from a previous
+// provider/location configuration must be discarded before it reaches this
+// function; this function itself does not re-check provenance.
 func (s *Service) saveWeatherData(data *WeatherData) error {
 	// Track operation duration
 	start := time.Now()
@@ -669,6 +739,10 @@ func (s *Service) safeFetchAndSave(ctx context.Context) {
 // Returns nil on success or if data is not modified (304 response).
 // Returns ErrWeatherAuthFailed when auth is currently disabled after repeated
 // 401s; that lockout clears automatically on a config change (see reconcileConfig).
+// Returns ErrWeatherFetchStale when the provider/location configuration was
+// saved while this request was in flight: the late result was discarded
+// without touching persistence, gauges, telemetry or backoff, and the caller
+// may retry once the new configuration's cycle has run.
 //
 // Unlike the StartPolling loop, Poll does not wrap the fetch in panic recovery:
 // it is a synchronous on-demand call, so a panic propagates to the caller.
@@ -766,6 +840,14 @@ func (s *Service) reconcileConfig(settings *conf.Settings) {
 // errors. For repeated authentication failures (HTTP 401), it pauses retrying
 // after maxConsecutiveAuthFailures until the auth-relevant config changes
 // (handled by reconcileConfig), at which point it resumes automatically.
+//
+// Provider/location provenance: the cycle captures a fetchConfigSnapshot after
+// reconciliation and re-checks it against the live settings once the provider
+// response returns. A response whose provider/location changed during the
+// request is discarded with ErrWeatherFetchStale — it never updates
+// daily/hourly persistence, the current-weather gauges, fetch telemetry, or
+// backoff — and the following cycle commits the new configuration's first
+// successful observation instead.
 func (s *Service) fetchAndSave(ctx context.Context) error {
 	// Serialize fetch cycles. Both the exported Poll() and the StartPolling
 	// ticker call this; the lock keeps the skip -> fetch -> reset sequence and
@@ -790,6 +872,13 @@ func (s *Service) fetchAndSave(ctx context.Context) error {
 	// cycle so every log/metric call below reports a consistent value.
 	provider, providerName := s.activeProvider()
 
+	// Capture the provider/location identity this fetch is started with, after
+	// reconciliation. The response is re-checked against the live settings
+	// snapshot before it may commit (commit gate below), so a result that
+	// arrives after a config save during the HTTP request cannot be persisted
+	// as current.
+	fetchConfig := s.captureFetchConfig(currentSettings)
+
 	// Check if we should skip this cycle due to backoff
 	if s.backoff.shouldSkip() {
 		if s.backoff.isAuthDisabled() {
@@ -809,22 +898,45 @@ func (s *Service) fetchAndSave(ctx context.Context) error {
 	// FetchWeather should now internally log its start/end/errors
 	data, err := provider.FetchWeather(ctx, currentSettings)
 
-	if err != nil {
-		// A cancelled context means the service is shutting down (or an
-		// on-demand caller aborted): treat it as benign so shutdown neither logs
-		// an error nor trips the failure backoff. context.DeadlineExceeded is
-		// intentionally excluded; that is a real request timeout worth a backoff.
-		if errors.Is(err, context.Canceled) {
-			// Cancellation is a shutdown or an aborted on-demand request, not a
-			// provider failure, so skip the failure/backoff bookkeeping below. Return
-			// the error rather than swallowing it so an on-demand Poll(ctx) caller
-			// still observes the cancellation; the StartPolling loop ignores
-			// fetchAndSave's return value, so a background shutdown stays benign.
-			getLogger().Debug("Weather fetch cancelled",
-				logger.String("provider", providerName))
-			return err
-		}
+	// A cancelled context means the service is shutting down (or an
+	// on-demand caller aborted): treat it as benign so shutdown neither logs
+	// an error nor trips the failure backoff, and it must not be mistaken for
+	// a stale result. context.DeadlineExceeded is intentionally excluded;
+	// that is a real request timeout worth a backoff.
+	if errors.Is(err, context.Canceled) {
+		// Cancellation is a shutdown or an aborted on-demand request, not a
+		// provider failure, so skip the failure/backoff bookkeeping below. Return
+		// the error rather than swallowing it so an on-demand Poll(ctx) caller
+		// still observes the cancellation; the StartPolling loop ignores
+		// fetchAndSave's return value, so a background shutdown stays benign.
+		getLogger().Debug("Weather fetch cancelled",
+			logger.String("provider", providerName))
+		return err
+	}
 
+	// Commit gate: the settings snapshot can be republished while the HTTP
+	// request above is in flight (a settings UI save does not take fetchMu).
+	// If the provider/location identity now differs from the snapshot this
+	// fetch started with, this result belongs to the previous configuration
+	// and must be deterministically discarded: no daily/hourly persistence,
+	// no gauge updates, no success/error/not-modified/no_data telemetry, and
+	// no backoff change. This covers every non-cancellation outcome (data,
+	// 304, 204, timeout, auth or network error) so the old generation cannot
+	// move any service state. The next cycle reconciles to the new config and
+	// fetches it; a timeout/network failure of the CURRENT configuration
+	// still takes the regular error/backoff path below, preserving the last
+	// good observation until a later cycle recovers.
+	if currentConfig := s.captureFetchConfig(s.currentSettings()); currentConfig != fetchConfig {
+		getLogger().Info("Discarding late weather result: provider/location changed while the fetch was in flight",
+			logger.String("fetch_provider", fetchConfig.providerName),
+			logger.String("current_provider", currentConfig.providerName),
+			logger.Bool("provider_changed", currentConfig.providerName != fetchConfig.providerName),
+			logger.Bool("location_changed",
+				currentConfig.latitude != fetchConfig.latitude || currentConfig.longitude != fetchConfig.longitude))
+		return ErrWeatherFetchStale
+	}
+
+	if err != nil {
 		// Handle "not modified" as a success case: no new data to save.
 		// Check before recording metrics so these expected conditions are
 		// not counted as errors.

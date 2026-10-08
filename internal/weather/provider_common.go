@@ -54,7 +54,19 @@ var (
 	// ErrWeatherDataNotModified indicates the data has not changed since
 	// the last request (e.g., HTTP 304). Not an error condition.
 	ErrWeatherDataNotModified = errors.Newf("weather data not modified").
-					Component("weather").Category(errors.CategoryNotFound).Build()
+				Component("weather").Category(errors.CategoryNotFound).Build()
+
+	// ErrWeatherFetchStale indicates a fetch result arrived after the
+	// provider/location configuration changed while its HTTP request was still
+	// in flight. The late result is deterministically discarded: it never
+	// reaches saveWeatherData (no daily_events/hourly_weather writes), the
+	// current-weather gauges, or the fetch telemetry, and it does not move the
+	// failure backoff. The next cycle fetches with the new configuration, whose
+	// first success then updates weather, precipitation, icon and sun times as
+	// one consistent snapshot. It is therefore not a provider failure: an
+	// on-demand Poll caller can simply retry after the new cycle completes.
+	ErrWeatherFetchStale = errors.Newf("weather result discarded: provider or location changed while the fetch was in flight").
+				Component("weather").Category(errors.CategoryConfiguration).Build()
 )
 
 // Backoff constants for the polling service

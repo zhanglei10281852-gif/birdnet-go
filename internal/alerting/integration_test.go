@@ -327,3 +327,88 @@ func TestIntegration_UnmatchedEventDoesNotFire(t *testing.T) {
 	assert.Equal(t, 0, recorder.count(), "unmatched event should not trigger any rule")
 	assert.Equal(t, 0, repo.historyCount())
 }
+
+// TestIntegration_BusStopDrainsAcceptedEventThroughEngine verifies the real
+// asynchronous chain: an event accepted by the bus before Stop is, by the time
+// Stop returns, fully evaluated by the engine and completed through action
+// dispatch and history persistence.
+func TestIntegration_BusStopDrainsAcceptedEventThroughEngine(t *testing.T) {
+	repo := newIntegrationRepo()
+	recorder := &actionRecorder{}
+	log := integrationLogger()
+
+	rule := &entities.AlertRule{
+		Name:        "Disconnected camera bell alert",
+		Enabled:     true,
+		ObjectType:  ObjectTypeStream,
+		TriggerType: TriggerTypeEvent,
+		EventName:   EventStreamDisconnected,
+		CooldownSec: 0,
+		Actions: []entities.AlertAction{
+			{Target: TargetBell},
+		},
+	}
+	require.NoError(t, repo.CreateRule(t.Context(), rule))
+
+	// Wire the same production shape: bus worker → engine → dispatcher action.
+	bus := NewAlertEventBus(nil)
+	engine := NewEngine(repo, recorder.dispatch, log, nil)
+	require.NoError(t, engine.RefreshRules(t.Context()))
+	bus.Subscribe(engine.HandleEvent)
+
+	bus.Publish(&AlertEvent{
+		ObjectType: ObjectTypeStream,
+		EventName:  EventStreamDisconnected,
+		Properties: map[string]any{PropertyStreamName: "backyard-cam"},
+		Timestamp:  time.Now(),
+	})
+
+	bus.Stop()
+
+	assert.Equal(t, 1, recorder.count(),
+		"the accepted event must complete action dispatch before Stop returns")
+	assert.Equal(t, "Disconnected camera bell alert", recorder.lastCall().ruleName)
+	assert.Contains(t, recorder.lastCall().targets, TargetBell)
+	assert.Equal(t, 1, repo.historyCount(),
+		"the accepted event must be persisted to history before Stop returns")
+}
+
+// TestIntegration_PostStopEventNeverReachesEngine verifies an event published
+// after the bus stopped is rejected at the boundary and leaves no action or
+// history trace downstream.
+func TestIntegration_PostStopEventNeverReachesEngine(t *testing.T) {
+	repo := newIntegrationRepo()
+	recorder := &actionRecorder{}
+	log := integrationLogger()
+
+	rule := &entities.AlertRule{
+		Name:        "Disconnected camera bell alert",
+		Enabled:     true,
+		ObjectType:  ObjectTypeStream,
+		TriggerType: TriggerTypeEvent,
+		EventName:   EventStreamDisconnected,
+		CooldownSec: 0,
+		Actions: []entities.AlertAction{
+			{Target: TargetBell},
+		},
+	}
+	require.NoError(t, repo.CreateRule(t.Context(), rule))
+
+	at := NewAlertingTelemetry()
+	bus := NewAlertEventBus(at)
+	engine := NewEngine(repo, recorder.dispatch, log, nil)
+	require.NoError(t, engine.RefreshRules(t.Context()))
+	bus.Subscribe(engine.HandleEvent)
+
+	bus.Stop()
+	bus.Publish(&AlertEvent{
+		ObjectType: ObjectTypeStream,
+		EventName:  EventStreamDisconnected,
+		Properties: map[string]any{PropertyStreamName: "backyard-cam"},
+		Timestamp:  time.Now(),
+	})
+
+	assert.Equal(t, 0, recorder.count())
+	assert.Equal(t, 0, repo.historyCount())
+	assert.Equal(t, int64(1), at.RejectedAfterStopCount())
+}

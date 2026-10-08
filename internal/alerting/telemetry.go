@@ -25,11 +25,45 @@ const (
 type AlertingTelemetry struct {
 	// droppedEvents counts events dropped due to full buffer since last report.
 	droppedEvents atomic.Int64
+
+	// rejectedAfterStop counts events that reached Publish after Stop:
+	// they are never buffered and never delivered.
+	rejectedAfterStop atomic.Int64
+
+	// panicCount counts handler panics recovered by the bus, including when
+	// Sentry reporting itself is unavailable.
+	panicCount atomic.Int64
 }
 
 // NewAlertingTelemetry creates a new alerting telemetry reporter.
 func NewAlertingTelemetry() *AlertingTelemetry {
 	return &AlertingTelemetry{}
+}
+
+// RejectedAfterStopCount returns how many events were explicitly rejected
+// because they reached Publish after Stop.
+func (at *AlertingTelemetry) RejectedAfterStopCount() int64 {
+	if at == nil {
+		return 0
+	}
+	return at.rejectedAfterStop.Load()
+}
+
+// PanicCount returns how many handler panics the bus has recovered.
+func (at *AlertingTelemetry) PanicCount() int64 {
+	if at == nil {
+		return 0
+	}
+	return at.panicCount.Load()
+}
+
+// DroppedEventCount returns how many events were dropped because the buffer
+// was full.
+func (at *AlertingTelemetry) DroppedEventCount() int64 {
+	if at == nil {
+		return 0
+	}
+	return at.droppedEvents.Load()
 }
 
 // ReportInitFailed reports that the alerting engine failed to initialize.
@@ -67,6 +101,9 @@ func (at *AlertingTelemetry) ReportPanic(panicValue any, stack []byte) {
 	if at == nil {
 		return
 	}
+
+	// Count locally first so the recovery is observable even without Sentry.
+	at.panicCount.Add(1)
 
 	panicType := fmt.Sprintf("%T", panicValue)
 
@@ -107,6 +144,17 @@ func (at *AlertingTelemetry) ReportEventDropped() {
 			telemetryComponent,
 		)
 	}
+}
+
+// ReportEventRejectedAfterStop counts an event that reached Publish after the
+// bus stopped. Such events are never buffered, so the counter is the only
+// record that work was refused; it keeps shutdown-boundary drops observable
+// separately from buffer-full drops.
+func (at *AlertingTelemetry) ReportEventRejectedAfterStop() {
+	if at == nil {
+		return
+	}
+	at.rejectedAfterStop.Add(1)
 }
 
 // ReportDBWriteFailed reports that a database operation in the engine failed.

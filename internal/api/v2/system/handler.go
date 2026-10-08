@@ -129,6 +129,7 @@ func (c *Handler) RegisterSystemRoutes(g *echo.Group) {
 	protectedGroup.GET("/database/stats", c.GetDatabaseStats)
 	protectedGroup.GET("/database/v2/stats", c.GetV2DatabaseStats)
 	protectedGroup.POST("/database/backup", c.DownloadDatabaseBackup)
+	protectedGroup.GET("/backup/status", c.GetBackupStatus)
 	protectedGroup.GET("/network-interfaces", c.GetNetworkInterfaces)
 	protectedGroup.GET("/restart-status", c.GetRestartStatus)
 	protectedGroup.GET("/models", c.GetActiveModels)

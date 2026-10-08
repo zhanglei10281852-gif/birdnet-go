@@ -65,6 +65,14 @@ type APIServerService struct {
 	controlChan    chan string
 	audioLevelChan chan audiocore.AudioLevelData
 
+	// Backup subsystem lifecycle. The scheduler must be stopped (cancelling
+	// and waiting for any in-flight runBackup) before the state manager is
+	// closed, so a scheduled backup can never write to a closed state store
+	// during shutdown.
+	backupManager   *backup.Manager
+	backupScheduler *backup.Scheduler
+	backupState     *backup.StateManager
+
 	// cancel stops background goroutines owned by subsystems (e.g. the OAuth2
 	// server's periodic token cleanup). Created in Start, invoked in Stop.
 	cancel context.CancelFunc
@@ -99,6 +107,9 @@ func (s *APIServerService) Start(ctx context.Context) error {
 	defer func() {
 		if !startSucceeded {
 			// Best-effort cleanup of partially initialized resources.
+			// Stop the backup scheduler before closing its state store so an
+			// interrupted run is persisted as recoverable, not orphaned.
+			s.stopBackupSystem()
 			if s.cancel != nil {
 				s.cancel()
 				s.cancel = nil
@@ -160,13 +171,16 @@ func (s *APIServerService) Start(ctx context.Context) error {
 
 	// Initialize backup system (optional; failure is non-fatal).
 	backupLog := logger.Global().Module("backup")
-	backupManager, backupScheduler, err := initializeBackupSystem(s.settings, backupLog)
+	backupManager, backupScheduler, backupState, err := initializeBackupSystem(s.settings, backupLog)
 	if err != nil {
 		backupLog.Error("Failed to initialize backup system", logger.Error(err))
 		GetLogger().Warn("backup system initialization failed",
 			logger.Error(err),
 			logger.String("operation", "backup_system_init"))
 	} else {
+		s.backupManager = backupManager
+		s.backupScheduler = backupScheduler
+		s.backupState = backupState
 		s.proc.SetBackupManager(backupManager)
 		s.proc.SetBackupScheduler(backupScheduler)
 	}
@@ -278,6 +292,13 @@ func (s *APIServerService) Stop(ctx context.Context) error {
 		s.cancel = nil
 	}
 
+	// Stop the backup scheduler (cancelling and waiting for any in-flight
+	// scheduled or manual backup) and only then close its state store. This
+	// runs before the HTTP server drains and before the database service
+	// stops, so no backup can keep writing after shutdown began and the
+	// interrupted plan is durably recorded for restart recovery.
+	s.stopBackupSystem()
+
 	// Stop system monitor.
 	if s.systemMonitor != nil {
 		log.Info("stopping system monitor",
@@ -385,13 +406,41 @@ func (s *APIServerService) ReconfigureMonitoring() {
 	s.systemMonitor = initializeSystemMonitor(conf.Setting())
 }
 
-// initializeBackupSystem sets up the backup manager and scheduler.
-func initializeBackupSystem(settings *conf.Settings, backupLog logger.Logger) (*backup.Manager, *backup.Scheduler, error) {
+// stopBackupSystem converges the backup scheduler, in-flight backup runs and
+// the persistent state store. The scheduler is stopped first: it cancels the
+// lifecycle context and waits for the run goroutine, whose final state write
+// therefore lands before StateManager.Close. The method is safe to call when
+// backup initialization failed or was skipped and is idempotent so Start
+// rollback and Stop can both invoke it.
+func (s *APIServerService) stopBackupSystem() {
+	log := GetLogger()
+	if s.backupScheduler != nil {
+		log.Info("stopping backup scheduler",
+			logger.String("operation", "shutdown_backup_scheduler"))
+		s.backupScheduler.Stop()
+		s.backupScheduler = nil
+	}
+	if s.backupState != nil {
+		log.Info("closing backup state manager",
+			logger.String("operation", "shutdown_backup_state"))
+		if err := s.backupState.Close(); err != nil {
+			log.Warn("backup state close error", logger.Error(err))
+		}
+		s.backupState = nil
+	}
+	// Manager holds no persistent resources; drop the reference once the
+	// scheduler that could invoke it has stopped.
+	s.backupManager = nil
+}
+
+// initializeBackupSystem sets up the backup manager, scheduler and persistent
+// state manager.
+func initializeBackupSystem(settings *conf.Settings, backupLog logger.Logger) (*backup.Manager, *backup.Scheduler, *backup.StateManager, error) {
 	backupLog.Info("Initializing backup system...")
 
 	stateManager, err := backup.NewStateManager(backupLog)
 	if err != nil {
-		return nil, nil, errors.New(err).
+		return nil, nil, nil, errors.New(err).
 			Component("analysis.api_service").
 			Category(errors.CategorySystem).
 			Context("operation", "initialize_backup_state_manager").
@@ -401,7 +450,7 @@ func initializeBackupSystem(settings *conf.Settings, backupLog logger.Logger) (*
 	// Use settings.Version for the app version
 	backupManager, err := backup.NewManager(settings, backupLog, stateManager, settings.Version)
 	if err != nil {
-		return nil, nil, errors.New(err).
+		return nil, nil, nil, errors.New(err).
 			Component("analysis.api_service").
 			Category(errors.CategorySystem).
 			Context("operation", "initialize_backup_manager").
@@ -409,7 +458,7 @@ func initializeBackupSystem(settings *conf.Settings, backupLog logger.Logger) (*
 	}
 	backupScheduler, err := backup.NewScheduler(backupManager, backupLog, stateManager)
 	if err != nil {
-		return nil, nil, errors.New(err).
+		return nil, nil, nil, errors.New(err).
 			Component("analysis.api_service").
 			Category(errors.CategorySystem).
 			Context("operation", "initialize_backup_scheduler").
@@ -444,7 +493,7 @@ func initializeBackupSystem(settings *conf.Settings, backupLog logger.Logger) (*
 	}
 
 	backupLog.Info("Backup system initialized.")
-	return backupManager, backupScheduler, nil
+	return backupManager, backupScheduler, stateManager, nil
 }
 
 // initializeSystemMonitor initializes and starts the system resource monitor if enabled

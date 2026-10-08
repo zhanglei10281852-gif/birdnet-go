@@ -131,6 +131,127 @@ type BackupStats struct {
 	LastBackupTime   time.Time // Time of the last backup operation
 }
 
+// Target outcome values used in run results and plan-instance progress.
+const (
+	// TargetStatusSuccess means the target stored the archive in this run.
+	TargetStatusSuccess = "success"
+	// TargetStatusFailed means the target returned an error in this run.
+	TargetStatusFailed = "failed"
+	// TargetStatusSkipped means the target already held the archive from a
+	// previous attempt of the same plan instance, so Store was not called.
+	TargetStatusSkipped = "skipped"
+)
+
+// RunOptions controls a single backup run. The zero value reproduces the
+// historical RunBackup behavior (timestamp now, daily/weekly inferred from
+// configuration). Recovery runs pin Time and the daily/weekly flags so backup
+// IDs stay identical to the interrupted attempt, and list targets whose
+// writes already completed so they are not submitted twice.
+type RunOptions struct {
+	// Time pins the backup timestamp. Zero means time.Now().UTC().
+	Time time.Time
+	// IsDaily and IsWeekly override the configuration-based weekly
+	// inference. Both nil keeps the historical behavior; set both for
+	// scheduled and recovery runs tied to a specific schedule.
+	IsDaily  *bool
+	IsWeekly *bool
+	// InstanceID is the StateManager plan instance this run belongs to,
+	// used to persist per-target progress. Empty means an untracked run.
+	InstanceID string
+	// CompletedTargets maps target name to the durable outcome recorded by
+	// a previous attempt of the same instance. A target that already holds
+	// the archive being produced is skipped instead of written again.
+	CompletedTargets map[string]TargetRunResult
+}
+
+// TargetOutcome is the result of storing one source archive in one target.
+type TargetOutcome struct {
+	Name     string
+	Status   string // TargetStatusSuccess | TargetStatusFailed | TargetStatusSkipped
+	BackupID string
+	Size     int64
+	Err      error
+}
+
+// SourceRunResult is the per-source outcome of a run.
+type SourceRunResult struct {
+	Name     string
+	BackupID string
+	Size     int64
+	Err      error
+	Targets  []TargetOutcome
+}
+
+// RunResult is the aggregated outcome of one backup run. The same result is
+// what callers use to update schedule state, plan-instance status, stats and
+// cleanup, so partial target failures can never be recorded as success.
+type RunResult struct {
+	Timestamp time.Time
+	Sources   []SourceRunResult
+}
+
+// Succeeded reports whether every source was backed up and every target
+// stored (or had previously stored) its archive. A single target failure
+// makes the whole run failed.
+func (r *RunResult) Succeeded() bool {
+	if r == nil {
+		return false
+	}
+	for i := range r.Sources {
+		if r.Sources[i].Err != nil {
+			return false
+		}
+		for _, outcome := range r.Sources[i].Targets {
+			if outcome.Status == TargetStatusFailed {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// FailureSummary returns a short human-readable summary of the errors recorded
+// in the result, or "" when the result is successful.
+func (r *RunResult) FailureSummary() string {
+	if r == nil {
+		return ""
+	}
+	var parts []string
+	for i := range r.Sources {
+		src := &r.Sources[i]
+		if src.Err != nil {
+			parts = append(parts, fmt.Sprintf("source %s: %v", src.Name, src.Err))
+		}
+		for _, outcome := range src.Targets {
+			if outcome.Status == TargetStatusFailed && outcome.Err != nil {
+				parts = append(parts, fmt.Sprintf("target %s: %v", outcome.Name, outcome.Err))
+			}
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+// BackupIDs returns the distinct archive IDs produced by the run.
+func (r *RunResult) BackupIDs() []string {
+	if r == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(r.Sources))
+	ids := make([]string, 0, len(r.Sources))
+	for i := range r.Sources {
+		id := r.Sources[i].BackupID
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // sanitizeConfig creates a copy of the configuration with sensitive data removed
 func sanitizeConfig(config *conf.Settings) *conf.Settings {
 	// Create a deep copy of the config using JSON serialization
@@ -287,15 +408,36 @@ func (m *Manager) Start() error {
 	return nil
 }
 
-// RunBackup performs an immediate backup of all sources
+// Enabled reports whether the backup manager is enabled in configuration.
+// Schedulers use it to decide whether an interrupted plan can be recovered.
+func (m *Manager) Enabled() bool {
+	return m.config.Enabled
+}
+
+// RunBackup performs an immediate backup of all sources. It is preserved as
+// the simple entry point used by manual triggers and tests; scheduled and
+// recovery runs use RunBackupWithOptions so their result can be attributed to
+// a single plan instance.
 func (m *Manager) RunBackup(ctx context.Context) error {
+	_, err := m.RunBackupWithOptions(ctx, RunOptions{})
+	return err
+}
+
+// RunBackupWithOptions performs a backup run controlled by opts and returns
+// the detailed per-source/per-target result together with the aggregated
+// error. Cancellation of ctx (application shutdown) propagates all the way
+// into source extraction and every target Store: nothing keeps running with
+// a detached background context.
+func (m *Manager) RunBackupWithOptions(ctx context.Context, opts RunOptions) (*RunResult, error) {
+	result := &RunResult{Timestamp: opts.Time}
+
 	// Early-return when backup is disabled. Scheduler-driven runs that land
 	// on a disabled manager must be a silent no-op, not a telemetry event.
 	// The Enabled flag is set once at construction so it does not need lock
 	// protection; the maps below do.
 	if !m.config.Enabled {
 		m.logger.Info("Backup manager is disabled")
-		return nil
+		return result, nil
 	}
 
 	// Snapshot the registered sources under a brief read lock and release
@@ -308,6 +450,7 @@ func (m *Manager) RunBackup(ctx context.Context) error {
 	m.mu.RLock()
 	sourcesLen := len(m.sources)
 	targetsLen := len(m.targets)
+	sourceNames := slices.Sorted(maps.Keys(m.sources))
 	sources := make(map[string]Source, sourcesLen)
 	maps.Copy(sources, m.sources)
 	m.mu.RUnlock()
@@ -320,29 +463,32 @@ func (m *Manager) RunBackup(ctx context.Context) error {
 	// below still fail fast.
 	if sourcesLen == 0 && targetsLen == 0 {
 		m.logger.Info("Backup run requested but no sources or targets configured; nothing to do")
-		return nil
+		return result, nil
 	}
 
 	// Validate that we have at least one source. This mirrors Start()'s
 	// independent sources/targets validation so the targets-only
 	// half-configured state fails fast instead of silently no-oping.
 	if sourcesLen == 0 {
-		return errors.Newf("no backup sources registered, backup cannot proceed").
+		return result, errors.Newf("no backup sources registered, backup cannot proceed").
 			Component("backup").
 			Category(errors.CategoryValidation).
 			Context("operation", "perform_backup").
 			Build()
 	}
 
-	// Add a timeout for the entire backup operation
-	ctx, cancel := context.WithTimeout(ctx, m.getBackupTimeout())
+	// Add a timeout for the entire backup operation. The timeout is layered
+	// on top of the caller's context, so a shutdown cancellation of the
+	// parent propagates immediately instead of being masked by a detached
+	// context.Background() timer.
+	runCtx, cancel := context.WithTimeout(ctx, m.getBackupTimeout())
 	defer cancel()
 
 	m.logger.Info("Starting backup process...")
 
 	// Validate that we have at least one target
 	if targetsLen == 0 {
-		return errors.Newf("no backup targets registered, backup cannot proceed").
+		return result, errors.Newf("no backup targets registered, backup cannot proceed").
 			Component("backup").
 			Category(errors.CategoryValidation).
 			Context("operation", "perform_backup").
@@ -350,37 +496,60 @@ func (m *Manager) RunBackup(ctx context.Context) error {
 	}
 
 	// Get current timestamp in UTC
-	now := time.Now().UTC()
+	now := opts.Time
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	result.Timestamp = now
 	// Determine if weekly backup day is configured and matches today
 	isWeekly := isWeeklyBackup(now, m.config.Schedules) // Pass all schedules
+	if opts.IsWeekly != nil {
+		isWeekly = *opts.IsWeekly
+	}
 	isDaily := !isWeekly
+	if opts.IsDaily != nil {
+		isDaily = *opts.IsDaily
+	}
 
 	var allTempDirs []string
 	var errs []error
 
 	// Process each source from the snapshot taken under the brief read lock
-	// above. Iterating the snapshot avoids holding the lock during long I/O
-	// and is safe against concurrent registration mutations.
-	for sourceName, source := range sources {
+	// above. Sorted names make execution and result order deterministic,
+	// which keeps recovery comparisons and logs stable. Iterating the
+	// snapshot avoids holding the lock during long I/O and is safe against
+	// concurrent registration mutations.
+	for _, sourceName := range sourceNames {
+		source := sources[sourceName]
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			// Clean up temp dirs before returning
 			m.cleanupTempDirectories(allTempDirs)
-			return errors.New(ctx.Err()).
+			result.Sources = append(result.Sources, SourceRunResult{
+				Name: sourceName,
+				Err: errors.New(runCtx.Err()).
+					Component("backup").
+					Category(errors.CategorySystem).
+					Context("operation", "perform_backup").
+					Context("error_type", "cancelled").
+					Build(),
+			})
+			return result, combineErrors(append(errs, errors.New(runCtx.Err()).
 				Component("backup").
 				Category(errors.CategorySystem).
 				Context("operation", "perform_backup").
 				Context("error_type", "cancelled").
-				Build()
+				Build()))
 		default:
 		}
 		startSourceTime := time.Now()
 		m.logger.Info("Processing backup source", logger.String("source_name", sourceName))
-		tempDirs, err := m.processBackupSource(ctx, sourceName, source, now, isDaily, isWeekly)
+		tempDirs, sourceResult := m.processBackupSource(runCtx, sourceName, source, now, isDaily, isWeekly, opts)
 		allTempDirs = append(allTempDirs, tempDirs...)
-		if err != nil {
-			m.logger.Error("Failed to process backup source", logger.String("source_name", sourceName), logger.Error(err))
-			errs = append(errs, errors.New(err).
+		result.Sources = append(result.Sources, sourceResult)
+		if sourceResult.Err != nil {
+			m.logger.Error("Failed to process backup source", logger.String("source_name", sourceName), logger.Error(sourceResult.Err))
+			errs = append(errs, errors.New(sourceResult.Err).
 				Component("backup").
 				Category(errors.CategorySystem).
 				Context("operation", "process_backup_source").
@@ -405,28 +574,45 @@ func (m *Manager) RunBackup(ctx context.Context) error {
 	if len(errs) > 0 {
 		combinedErr := combineErrors(errs)
 		m.logger.Error("Backup process completed with errors", logger.Int("error_count", len(errs)), logger.Error(combinedErr))
-		// Optionally update overall state manager status here if needed
-		return combinedErr
+		return result, combinedErr
+	}
+
+	// A source can complete while an individual target failed: surface that
+	// as an error as well, otherwise callers would record the schedule as
+	// successful even though part of the backup is missing.
+	if !result.Succeeded() {
+		combinedErr := errors.Newf("backup completed with target failures: %s", result.FailureSummary()).
+			Component("backup").
+			Category(errors.CategorySystem).
+			Context("operation", "perform_backup").
+			Build()
+		m.logger.Error("Backup process completed with target errors", logger.Error(combinedErr))
+		return result, combinedErr
 	}
 
 	m.logger.Info("Backup process completed successfully")
-	// Optionally update overall state manager status here if needed
-	return nil
+	return result, nil
 }
 
 // processBackupSource handles the backup process for a single source
-func (m *Manager) processBackupSource(ctx context.Context, sourceName string, source Source, timestamp time.Time, isDaily, isWeekly bool) ([]string, error) {
+func (m *Manager) processBackupSource(ctx context.Context, sourceName string, source Source, timestamp time.Time, isDaily, isWeekly bool, opts RunOptions) ([]string, SourceRunResult) {
+	sourceResult := SourceRunResult{Name: sourceName}
 	tempDirs := make([]string, 0, 1) // Track temp dirs created in this function
+
+	fail := func(err error) ([]string, SourceRunResult) {
+		sourceResult.Err = err
+		return tempDirs, sourceResult
+	}
 
 	// 1. Perform the actual backup from the source
 	m.logger.Debug("Starting source backup", logger.String("source_name", sourceName))
 	backupReader, err := source.Backup(ctx)
 	if err != nil {
-		return tempDirs, errors.New(err).
+		return fail(errors.New(err).
 			Component("backup").
 			Category(errors.CategorySystem).
 			Context("operation", "initiate_backup").
-			Build()
+			Build())
 	}
 	defer func() {
 		if err := backupReader.Close(); err != nil {
@@ -438,12 +624,12 @@ func (m *Manager) processBackupSource(ctx context.Context, sourceName string, so
 	// 2. Create a temporary directory for staging the archive
 	tempDir, err := os.MkdirTemp("", fmt.Sprintf("birdnet-go-backup-%s-*", sourceName))
 	if err != nil {
-		return tempDirs, errors.New(err).
+		return fail(errors.New(err).
 			Component("backup").
 			Category(errors.CategoryFileIO).
 			Context("operation", "create_temp_directory").
 			Context("source", source.Name()).
-			Build()
+			Build())
 	}
 	tempDirs = append(tempDirs, tempDir) // Add to cleanup list
 	m.logger.Debug("Created temporary directory", logger.String("source_name", sourceName), logger.String("temp_dir", tempDir))
@@ -482,11 +668,11 @@ func (m *Manager) processBackupSource(ctx context.Context, sourceName string, so
 
 	// 5. Create and populate the archive
 	if err := m.createArchive(ctx, archivePath, backupReader, metadata); err != nil {
-		return tempDirs, errors.New(err).
+		return fail(errors.New(err).
 			Component("backup").
 			Category(errors.CategoryFileIO).
 			Context("operation", "create_backup_archive").
-			Build()
+			Build())
 	}
 	m.logger.Debug("Archive created successfully", logger.String("source_name", sourceName), logger.String("archive_path", archivePath))
 
@@ -497,11 +683,11 @@ func (m *Manager) processBackupSource(ctx context.Context, sourceName string, so
 		encryptedArchivePath := archivePath + ".enc" // Convention for encrypted file
 		err := m.encryptArchive(ctx, archivePath, encryptedArchivePath)
 		if err != nil {
-			return tempDirs, errors.New(err).
+			return fail(errors.New(err).
 				Component("backup").
 				Category(errors.CategorySystem).
 				Context("operation", "encrypt_archive").
-				Build()
+				Build())
 		}
 		// Clean up the unencrypted archive
 		if err := os.Remove(archivePath); err != nil {
@@ -517,14 +703,15 @@ func (m *Manager) processBackupSource(ctx context.Context, sourceName string, so
 	// 7. Update metadata with final size and checksum (of the final file, possibly encrypted)
 	fileInfo, err := os.Stat(finalArchivePath)
 	if err != nil {
-		return tempDirs, errors.New(err).
+		return fail(errors.New(err).
 			Component("backup").
 			Category(errors.CategoryFileIO).
 			Context("operation", "stat_archive_file").
 			Context("archive_path", archivePath).
-			Build()
+			Build())
 	}
 	metadata.Size = fileInfo.Size()
+	sourceResult.Size = metadata.Size
 	m.logger.Debug("Updated metadata with final size", logger.String("source_name", sourceName), logger.Int64("size", metadata.Size))
 
 	// Calculate checksum if needed (optional, can be time-consuming)
@@ -536,16 +723,18 @@ func (m *Manager) processBackupSource(ctx context.Context, sourceName string, so
 	// }
 
 	// 8. Store the final archive in all registered targets
-	if err := m.storeBackupInTargets(ctx, finalArchivePath, metadata); err != nil {
-		return tempDirs, errors.New(err).
+	outcomes, storeErr := m.storeBackupInTargets(ctx, finalArchivePath, metadata, opts)
+	sourceResult.Targets = outcomes
+	if storeErr != nil {
+		return fail(errors.New(storeErr).
 			Component("backup").
 			Category(errors.CategorySystem).
 			Context("operation", "store_backup_in_targets").
-			Build()
+			Build())
 	}
 
 	m.logger.Debug("Finished processing source", logger.String("source_name", sourceName))
-	return tempDirs, nil // Return tempDirs for cleanup by the caller
+	return tempDirs, sourceResult // Return tempDirs for cleanup by the caller
 }
 
 // hashConfig calculates the SHA256 hash of the sanitized configuration
@@ -612,75 +801,141 @@ func (m *Manager) addConfigToArchive(tw *tar.Writer, metadata *Metadata) error {
 	return nil
 }
 
-// storeBackupInTargets stores the created backup archive in all registered targets
-func (m *Manager) storeBackupInTargets(ctx context.Context, archivePath string, metadata *Metadata) error {
+// storeBackupInTargets stores the created backup archive in all registered
+// targets. Targets that already durably stored this archive during a previous
+// attempt of the same plan instance are skipped (no Store call, no counter
+// increment), so a recovered run never re-submits a completed target write.
+// Every target outcome is persisted on the plan instance before the function
+// returns, which is the progress record restart recovery relies on.
+func (m *Manager) storeBackupInTargets(ctx context.Context, archivePath string, metadata *Metadata, opts RunOptions) ([]TargetOutcome, error) {
 	m.mu.RLock()
 	targetsToStore := slices.Collect(maps.Values(m.targets))
 	m.mu.RUnlock()
+	// Sort targets by name for deterministic outcome order and log output.
+	slices.SortFunc(targetsToStore, func(a, b Target) int {
+		return strings.Compare(a.Name(), b.Name())
+	})
 
+	outcomes := make([]TargetOutcome, len(targetsToStore))
 	if len(targetsToStore) == 0 {
 		m.logger.Warn("No backup targets registered, skipping storage", logger.String("archive_path", archivePath))
-		return nil // Not necessarily an error if no targets are configured
+		return outcomes, nil // Not necessarily an error if no targets are configured
 	}
 
 	var wg sync.WaitGroup
-	errChan := make(chan error, len(targetsToStore))
 	storeCtx, cancel := context.WithTimeout(ctx, m.getStoreTimeout()) // Apply specific timeout for storing
 	defer cancel()
 
 	m.logger.Info("Storing backup archive in targets", logger.String("backup_id", metadata.ID), logger.Int("targets_count", len(targetsToStore)))
 
-	for _, target := range targetsToStore {
+	for idx, target := range targetsToStore {
 		wg.Go(func() {
 			targetName := target.Name()
+			outcome := TargetOutcome{Name: targetName, BackupID: metadata.ID}
+
+			// Idempotent recovery: if this target already stored this exact
+			// archive during an earlier attempt of the same instance, do not
+			// call Store or bump its counters again.
+			if prior, ok := opts.CompletedTargets[targetName]; ok && slices.Contains(prior.BackupIDs, metadata.ID) {
+				m.logger.Info("Skipping target that already stored this backup",
+					logger.String("backup_id", metadata.ID),
+					logger.String("target_name", targetName))
+				outcome.Status = TargetStatusSkipped
+				outcome.Size = prior.Size
+				outcomes[idx] = outcome
+				m.recordInstanceTargetProgress(opts.InstanceID, &TargetRunResult{
+					Name:      targetName,
+					Status:    targetOutcomeSkipped,
+					BackupIDs: []string{metadata.ID},
+					Size:      0, // Do not double count size: previous attempt already accounted for it.
+				})
+				return
+			}
+
 			startTargetTime := time.Now()
 			m.logger.Info("Storing backup in target", logger.String("backup_id", metadata.ID), logger.String("target_name", targetName))
 
 			if err := target.Store(storeCtx, archivePath, metadata); err != nil {
-				wrappedErr := errors.New(err).
-					Component("backup").
-					Category(errors.CategorySystem).
-					Context("operation", "store_backup").
-					Context("target_name", targetName).
-					Build()
+				outcome.Status = TargetStatusFailed
+				outcome.Err = err
 				m.logger.Error("Failed to store backup in target", logger.String("backup_id", metadata.ID), logger.String("target_name", targetName), logger.Error(err))
-				errChan <- wrappedErr
 				// Update state for this specific target failure
 				if m.stateManager != nil {
-					if err := m.stateManager.UpdateTargetState(targetName, metadata, "failed"); err != nil {
-						m.logger.Warn("Failed to update target state after storage failure", logger.String("target_name", targetName), logger.Error(err))
+					if stateErr := m.stateManager.UpdateTargetState(targetName, metadata, TargetStatusFailed); stateErr != nil {
+						m.logger.Warn("Failed to update target state after storage failure", logger.String("target_name", targetName), logger.Error(stateErr))
 					}
 				}
 			} else {
+				outcome.Status = TargetStatusSuccess
+				outcome.Size = metadata.Size
 				m.logger.Info("Successfully stored backup in target",
 					logger.String("backup_id", metadata.ID),
 					logger.String("target_name", targetName),
 					logger.Int64("duration_ms", time.Since(startTargetTime).Milliseconds()))
 				// Update state for this specific target success
 				if m.stateManager != nil {
-					if err := m.stateManager.UpdateTargetState(targetName, metadata, "success"); err != nil {
-						m.logger.Warn("Failed to update target state after storage success", logger.String("target_name", targetName), logger.Error(err))
+					if stateErr := m.stateManager.UpdateTargetState(targetName, metadata, TargetStatusSuccess); stateErr != nil {
+						m.logger.Warn("Failed to update target state after storage success", logger.String("target_name", targetName), logger.Error(stateErr))
 					}
 				}
 			}
+			m.recordInstanceTargetProgress(opts.InstanceID, &TargetRunResult{
+				Name:      targetName,
+				Status:    outcome.Status,
+				BackupIDs: []string{metadata.ID},
+				Size:      metadata.Size,
+				Error:     targetOutcomeErrorString(outcome),
+			})
+			outcomes[idx] = outcome
 		})
 	}
 
 	wg.Wait()
-	close(errChan)
 
-	// Collect errors
+	// Collect errors in target order so aggregated errors are deterministic.
 	storeErrors := make([]error, 0, len(targetsToStore))
-	for err := range errChan {
-		storeErrors = append(storeErrors, err)
+	for i := range outcomes {
+		if outcomes[i].Err != nil {
+			storeErrors = append(storeErrors, errors.New(outcomes[i].Err).
+				Component("backup").
+				Category(errors.CategorySystem).
+				Context("operation", "store_backup").
+				Context("target_name", outcomes[i].Name).
+				Build())
+		}
 	}
 
 	if len(storeErrors) > 0 {
-		return combineErrors(storeErrors)
+		return outcomes, combineErrors(storeErrors)
 	}
 
 	m.logger.Info("Finished storing backup archive in all targets", logger.String("backup_id", metadata.ID))
-	return nil
+	return outcomes, nil
+}
+
+// recordInstanceTargetProgress persists one target outcome on the plan
+// instance. Failures are logged but never fail the backup itself: the
+// returned RunResult remains the authoritative outcome even if progress
+// persistence is unavailable.
+func (m *Manager) recordInstanceTargetProgress(instanceID string, result *TargetRunResult) {
+	if m.stateManager == nil || instanceID == "" {
+		return
+	}
+	if err := m.stateManager.RecordInstanceTarget(instanceID, result); err != nil {
+		m.logger.Warn("Failed to record plan instance target progress",
+			logger.String("instance_id", instanceID),
+			logger.String("target_name", result.Name),
+			logger.Error(err))
+	}
+}
+
+// targetOutcomeErrorString renders an outcome error for durable state,
+// returning "" when there is no error.
+func targetOutcomeErrorString(outcome TargetOutcome) string {
+	if outcome.Err == nil {
+		return ""
+	}
+	return outcome.Err.Error()
 }
 
 // performBackupCleanup triggers the cleanup process for old backups across all targets.
@@ -891,6 +1146,29 @@ func (m *Manager) addBackupDataToArchive(ctx context.Context, tw *tar.Writer, re
 		Mode:    int64(PermArchiveFile), // Standard file permissions
 		ModTime: metadata.Timestamp,
 		// Size is unknown for streaming, tar writer handles this.
+	}
+
+	// archive/tar rejects bytes past the declared header size with
+	// "write too long", so fill in the size when the source offers a
+	// seekable stream (spooled backups and in-memory/test sources). Truly
+	// streaming non-seekable pipes keep the historical zero-size behavior.
+	if seeker, ok := reader.(io.Seeker); ok {
+		size, seekErr := seeker.Seek(0, io.SeekEnd)
+		if seekErr != nil {
+			return errors.New(seekErr).
+				Component("backup").
+				Category(errors.CategoryFileIO).
+				Context("operation", "seek_backup_data_end").
+				Build()
+		}
+		if _, seekErr = seeker.Seek(0, io.SeekStart); seekErr != nil {
+			return errors.New(seekErr).
+				Component("backup").
+				Category(errors.CategoryFileIO).
+				Context("operation", "seek_backup_data_start").
+				Build()
+		}
+		hdr.Size = size
 	}
 
 	// Write header
